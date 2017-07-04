@@ -29,6 +29,10 @@ from util.text import sparse_tensor_value_to_texts, wer
 from xdg import BaseDirectory as xdg
 import numpy as np
 
+from keras.models import Sequential
+from keras.layers import BatchNormalization, Conv1D, Dense, InputLayer, GRU, TimeDistributed
+from keras import backend as K
+
 
 # Importer
 # ========
@@ -349,67 +353,41 @@ def variable_on_worker_level(name, shape, initializer):
         var = tf.get_variable(name=name, shape=shape, initializer=initializer)
     return var
 
-def conv_output_length(input_length, filter_size, padding, stride,
-                       dilation=1):
+def conv_output_length(input_length, filter_size, padding, stride, dilation=1):
     ''' Compute the length of the output sequence after 1D convolution along
         time.
     Params:
         input_length (int): Length of the input sequence.
         filter_size (int): Width of the convolution kernel.
-        padding (str): Only support `SAME` or `VALID`.
+        padding (str): Only support `same` or `valid`.
         stride (int): Stride size used in 1D convolution.
         dilation (int)
     '''
     if input_length is None:
         return None
-    assert padding in {'SAME', 'VALID'}
+    assert padding in {'same', 'valid'}
     dilated_filter_size = filter_size + (filter_size - 1) * (dilation - 1)
-    if padding == 'SAME':
+    if padding == 'same':
         output_length = input_length
-    elif padding == 'VALID':
+    elif padding == 'valid':
         output_length = input_length - dilated_filter_size + 1
     return (output_length + stride - 1) // stride
 
-def BiRNN(batch_x, seq_length, dropout, is_training, reuse):
+def BiRNN(batch_x, seq_length, dropout, reuse):
     # Input shape: [batch_size, n_steps, n_input]
-    with tf.contrib.slim.arg_scope([tf.contrib.slim.model_variable, tf.contrib.slim.variable], device="/cpu:0"):
-        # One layer of 1D convolution with SAME padding
-        with tf.variable_scope('conv1d') as scope:
-            layer_1 = tf.contrib.layers.convolution2d(
-                inputs=batch_x,
-                num_outputs=n_hidden,
-                kernel_size=[FLAGS.kernel_size],
-                stride=FLAGS.stride,
-                padding='SAME',
-                normalizer_fn=tf.contrib.layers.batch_norm,
-                normalizer_params={'is_training': is_training},
-                scope=scope,
-                reuse=reuse)
+    model = Sequential()
+    model.add(InputLayer(input_tensor=batch_x, input_shape=(None, None, n_input)))
+    model.add(Conv1D(n_hidden, FLAGS.kernel_size, strides=FLAGS.stride, padding='valid', activation='relu'))
+    model.add(BatchNormalization(momentum=FLAGS.decay))
+    for _ in range(FLAGS.recurrent_layers):
+        model.add(GRU(n_hidden, activation='relu', return_sequences=True))
+        model.add(BatchNormalization(momentum=FLAGS.decay))
+    model.add(TimeDistributed(Dense(n_character)))
 
-        output_lengths = conv_output_length(seq_length, FLAGS.kernel_size, 'SAME', FLAGS.stride)
+    output_lengths = conv_output_length(seq_length, FLAGS.kernel_size, 'valid', FLAGS.stride)
 
-        # Store individual statistics for a max of 10 seconds worth of time steps
-        # 10 seconds * (1/0.01) time steps per second = 1000 time steps
-        max_bn_steps = 1000
-        # Three layers of GRU cells with 1024 nodes each
-        cell = BNGRUCell(n_hidden, is_training, max_bn_steps=max_bn_steps, decay=FLAGS.decay)
-        multi_cell = tf.contrib.rnn.MultiRNNCell([cell] * FLAGS.recurrent_layers)
-        rnn_outputs, _ = tf.nn.dynamic_rnn(cell=multi_cell,
-                                           inputs=layer_1,
-                                           sequence_length=output_lengths,
-                                           dtype=tf.float32)
-
-        # A final fully connected layer with linear activation
-        with tf.variable_scope('fc') as scope:
-            network_output = tf.contrib.layers.fully_connected(
-                inputs=rnn_outputs,
-                num_outputs=n_character,
-                activation_fn=None,
-                scope=scope,
-                reuse=reuse)
-
-        # Transpose to time major
-        network_output = tf.transpose(network_output, [1, 0, 2])
+    # Transpose to time major
+    network_output = tf.transpose(model.output, [1, 0, 2])
 
     # Output shape: [n_steps, batch_size, n_output]
     return network_output, tf.cast(output_lengths, tf.int32)
@@ -425,7 +403,7 @@ def BiRNN(batch_x, seq_length, dropout, is_training, reuse):
 # Conveniently, this loss function is implemented in TensorFlow.
 # Thus, we can simply make use of this implementation to define our loss.
 
-def calculate_mean_edit_distance_and_loss(batch_set, dropout, is_training, reuse):
+def calculate_mean_edit_distance_and_loss(batch_set, dropout, reuse):
     r'''
     This routine beam search decodes a mini-batch and calculates the loss and mean edit distance.
     Next to total and average loss it returns the mean edit distance,
@@ -435,7 +413,7 @@ def calculate_mean_edit_distance_and_loss(batch_set, dropout, is_training, reuse
     batch_x, batch_seq_len, batch_y = batch_set.next_batch()
 
     # Calculate the logits of the batch using BiRNN
-    logits, out_lengths = BiRNN(batch_x, tf.to_int64(batch_seq_len), dropout, is_training, reuse)
+    logits, out_lengths = BiRNN(batch_x, tf.to_int64(batch_seq_len), dropout, reuse)
 
     # Compute the CTC loss using either TensorFlow's `ctc_loss` or Baidu's `warp_ctc_loss`.
     if FLAGS.use_warpctc:
@@ -498,7 +476,7 @@ def create_optimizer():
 # on which all operations within the tower execute.
 # For example, all operations of 'tower 0' could execute on the first GPU `tf.device('/gpu:0')`.
 
-def get_tower_results(batch_set, optimizer, is_training):
+def get_tower_results(batch_set, optimizer):
     r'''
     With this preliminary step out of the way, we can for each GPU introduce a
     tower for which's batch we calculate
@@ -554,7 +532,7 @@ def get_tower_results(batch_set, optimizer, is_training):
                     # Calculate the avg_loss and mean_edit_distance and retrieve the decoded
                     # batch along with the original batch's labels (Y) of this tower
                     total_loss, avg_loss, distance, mean_edit_distance, decoded, labels = \
-                        calculate_mean_edit_distance_and_loss(batch_set, no_dropout if optimizer is None else dropout_rates)
+                        calculate_mean_edit_distance_and_loss(batch_set, no_dropout if optimizer is None else dropout_rates, i > 0)
 
                     # Allow for variables to be re-used by the next tower
                     tf.get_variable_scope().reuse_variables()
@@ -1400,10 +1378,8 @@ def train(server=None):
                                                    replicas_to_aggregate=FLAGS.replicas_to_agg,
                                                    total_num_replicas=FLAGS.replicas)
 
-    is_training_ph = tf.placeholder(tf.bool, name="is_training")
-
     # Get the data_set specific graph end-points
-    results_tuple, gradients, mean_edit_distance, loss = get_tower_results(switchable_data_set, optimizer, is_training=is_training_ph)
+    results_tuple, gradients, mean_edit_distance, loss = get_tower_results(switchable_data_set, optimizer)
 
     # Average tower gradients across GPUs
     avg_tower_gradients = average_gradients(gradients)
@@ -1467,7 +1443,7 @@ def train(server=None):
             try:
                 if is_chief:
                     # Retrieving global_step from the (potentially restored) model
-                    feed_dict = {'is_training:0': True}
+                    feed_dict = {K.learning_phase(): 0}
                     switchable_data_set.set_data_set(feed_dict, data_sets.train)
                     step = session.run(global_step, feed_dict=feed_dict)
                     COORD.start_coordination(data_sets, step)
@@ -1480,7 +1456,7 @@ def train(server=None):
 
                     is_training = job.set_name == 'train'
                     # The feed_dict (mainly for switching between queues)
-                    feed_dict = {"is_training:0": is_training}
+                    feed_dict = {K.learning_phase(): is_training}
 
                     # Sets the current data_set on SwitchableDataSet switchable_data_set
                     # and the respective placeholder in feed_dict
@@ -1491,9 +1467,6 @@ def train(server=None):
 
                     # Setting the training operation in case of training requested
                     train_op = apply_gradient_op if job.set_name == 'train' else []
-
-                    # Batch normalization update OPs
-                    update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS) if is_training else []
 
                     # Requirements to display a WER report
                     if job.report:
@@ -1516,7 +1489,7 @@ def train(server=None):
 
                         log_debug('Starting batch...')
                         # Compute the batch
-                        _, _, current_step, batch_loss, batch_report = session.run([train_op, update_ops, global_step, loss, report_params], **extra_params)
+                        _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
 
                         # Uncomment the next line for debugging race conditions / distributed TF
                         log_debug('Finished batch step %d.' % current_step)
